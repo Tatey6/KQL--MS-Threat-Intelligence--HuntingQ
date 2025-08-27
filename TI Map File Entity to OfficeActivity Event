@@ -1,0 +1,35 @@
+let starttime = todatetime('{{StartTimeISO}}'); //starttime → Time window for OfficeActivity logs (injected dynamically by Sentinel when running the rule).
+let endtime = todatetime('{{EndTimeISO}}'); //endtime → Time window for OfficeActivity logs (injected dynamically by Sentinel when running the rule).
+let ioc_lookBack = 14d;
+ThreatIntelIndicators
+| where TimeGenerated >= ago(ioc_lookBack) and ValidUntil > now()
+| summarize LatestIndicatorTime = arg_max(TimeGenerated, *) by Id //Reduces to the latest version of each indicator
+| where IsActive == true //Filters to active indicators (IsActive == true) that are not expired.
+//extract key part of kv pair
+| extend IndicatorType = replace(@"\[|\]|\""", "", tostring(split(ObservableKey, ":", 0)))
+| where IndicatorType == "file" //Only keeps indicators of type "file"
+| extend FileName = ObservableValue //Extracts the file name value into FileName
+| where isnotempty(FileName)
+// using innerunique to keep perf fast and result set low, we only need one match to indicate potential malicious activity that needs to be investigated
+| join kind=innerunique (
+  OfficeActivity
+  | where TimeGenerated between(starttime..endtime) //Looks at OfficeActivity logs in the given time range.
+  | where isnotempty(SourceFileName) //Only keeps events that have a SourceFileName (file activity).
+  | extend OfficeActivity_TimeGenerated = TimeGenerated
+)
+on $left.FileName == $right.SourceFileName //joins them to IOCs where file name matches exactly.
+| where OfficeActivity_TimeGenerated < ValidUntil //Makes sure the IOC hadn’t expired when the activity occurred.
+| summarize OfficeActivity_TimeGenerated = arg_max(OfficeActivity_TimeGenerated, *) by Id, SourceFileName
+| extend Description = tostring(parse_json(Data).description) //Enriches results with threat intel description
+| extend ActivityGroupNames = extract(@"ActivityGroup:(\S+)", 1, tostring(parse_json(Data).labels)) //Extracts ActivityGroup name (e.g., threat actor attribution) if present in labels.
+| project OfficeActivity_TimeGenerated, Description, ActivityGroupNames, Id, Type, ValidUntil, Confidence, FileName, UserId, ClientIP, OfficeObjectId//, Url
+| extend timestamp = OfficeActivity_TimeGenerated, Name = tostring(split(UserId, '@', 0)[0]), UPNSuffix = tostring(split(UserId, '@', 1)[0]) 
+| extend Account_0_Name = Name
+| extend Account_0_UPNSuffix = UPNSuffix
+| extend IP_0_Address = ClientIP
+//| extend URL_0_Url = Url
+//Pulls all file-name IOCs from threat intel (last 14 days, still valid).
+//Looks for Office 365 file activities (like sharing, accessing, moving files).
+//Flags cases where a file with a name matching an IOC was seen.
+//Enriches the match with metadata (description, threat actor, confidence, user, IP).
+//Outputs the latest matching event per IOC/file.
