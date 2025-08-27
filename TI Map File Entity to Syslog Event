@@ -1,0 +1,32 @@
+let starttime = todatetime('{{StartTimeISO}}');
+ let endtime = todatetime('{{EndTimeISO}}');
+ let ioc_lookBack = 14d;
+ ThreatIntelIndicators
+ | where TimeGenerated >= ago(ioc_lookBack) and ValidUntil > now()
+ | summarize LatestIndicatorTime = arg_max(TimeGenerated, *) by Id //Deduplicate to the most recent record per indicator Id
+ | where IsActive == true
+ //extract key part of kv pair
+ | extend IndicatorType = replace(@"\[|\]|\""", "", tostring(split(ObservableKey, ":", 0))) //Parse ObservableKey, take the part before :
+ | where IndicatorType == "file"
+ | extend FileName = ObservableValue
+ | where isnotempty(FileName) //Drop rows without a filename
+ | extend TI_ProcessEntity = tostring(split(FileName, ".")[-2]) //Derive a process name–like token from the filename by taking the penultimate .-separated part - Example: malware.exe → ["malware","exe"] → -2 → malware
+ // using innerunique to keep perf fast and result set low, we only need one match to indicate potential malicious activity that needs to be investigated
+ | join kind=innerunique (
+   Syslog
+   | where TimeGenerated between(starttime..endtime)
+   | where isnotempty(ProcessName)
+   | extend Syslog_TimeGenerated = TimeGenerated
+ )
+ on $left.TI_ProcessEntity == $right.ProcessName //Join condition: exact string equality between the TI-derived token and Syslog.ProcessName
+ | where Syslog_TimeGenerated < ValidUntil //Ensure the IOC was still valid when the syslog event happened.
+ | summarize Syslog_TimeGenerated = arg_max(Syslog_TimeGenerated, *) by Id, ProcessName
+ | extend Description = tostring(parse_json(Data).description) //Pull a human-readable description from the TI payload (Data JSON)
+ | extend ActivityGroupNames = extract(@"ActivityGroup:(\S+)", 1, tostring(parse_json(Data).labels)) //Regex-extract a threat-actor / activity-group tag from TI labels (if present).
+ | project Syslog_TimeGenerated, Description, ActivityGroupNames, Id, Type, ValidUntil, Confidence,//Url
+ FileName, Computer, HostIP, SyslogMessage
+ | extend timestamp = Syslog_TimeGenerated, HostName = split(Computer, '.', 0)[0], DnsDomain = strcat_array(array_slice(split(Computer, '.'), 1, -1), '.')
+ | extend Host_0_HostName = HostName
+ | extend Host_0_DnsDomain = DnsDomain
+ | extend IP_0_Address = HostIP
+ //| extend URL_0_Url = Url
