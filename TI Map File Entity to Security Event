@@ -1,0 +1,35 @@
+let starttime = todatetime('{{StartTimeISO}}');
+let endtime = todatetime('{{EndTimeISO}}');
+let ioc_lookBack = 14d;
+ThreatIntelIndicators
+| where TimeGenerated >= ago(ioc_lookBack) and ValidUntil > now() //Keep only indicators created/updated within the last 14 days
+| summarize LatestIndicatorTime = arg_max(TimeGenerated, *) by Id //For each indicator Id, keep the latest record
+| where IsActive == true
+//extract key part of kv pair
+| extend IndicatorType = replace(@"\[|\]|\""", "", tostring(split(ObservableKey, ":", 0))) //Parse ObservableKey, grab the type portion before :
+| where IndicatorType == "file"
+| extend FileName = ObservableValue //Move the observable’s value (the file name) into a convenient FileName column
+| where isnotempty(FileName)
+| extend _lowerFileName = tolower(FileName) //Precompute a lowercase version for case-insensitive matching
+// using innerunique to keep perf fast and result set low, we only need one match to indicate potential malicious activity that needs to be investigated
+| join kind=innerunique (
+  SecurityEvent 
+  | where TimeGenerated between(starttime..endtime)
+  | where EventID in ("4688","8002","4648","4673") //Keep only specific event types
+  | where isnotempty(Process)
+  | extend SecurityEvent_TimeGenerated = TimeGenerated, Event = EventID, _lowerProcess = tolower(Process) //Create convenient fields: a renamed timestamp, a short Event alias, and a lowercase Process for matching
+)
+on $left._lowerFileName == $right._lowerProcess //exact equality between the IOC file name and the event’s process
+| where SecurityEvent_TimeGenerated < ValidUntil
+| summarize SecurityEvent_TimeGenerated = arg_max(SecurityEvent_TimeGenerated, *) by Id, Process
+| extend Description = tostring(parse_json(Data).description) //Pull the indicator’s human-readable description from the TI JSON blob
+| extend ActivityGroupNames = extract(@"ActivityGroup:(\S+)", 1, tostring(parse_json(Data).labels))
+| project SecurityEvent_TimeGenerated, Description, ActivityGroupNames, Id, Type, ValidUntil, Confidence,
+FileName, Computer, IpAddress, Account, Event, Activity//, Url
+| extend timestamp = SecurityEvent_TimeGenerated, NTDomain = split(Account, '\\', 0)[0], Name = split(Account, '\\', 1)[0], HostName = split(Computer, '.', 0)[0], DnsDomain = strcat_array(array_slice(split(Computer, '.'), 1, -1), '.')
+| extend Account_0_Name = Name
+| extend Account_0_NTDomain = NTDomain
+| extend Host_0_HostName = HostName
+| extend Host_0_DnsDomain = DnsDomain
+| extend IP_0_Address = IpAddress
+//| extend URL_0_Url = Url
