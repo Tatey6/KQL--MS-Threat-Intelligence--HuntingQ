@@ -1,3 +1,5 @@
+//DO NOT USE VMCONNECTION TABLE - UNUSABLE
+
 let starttime = todatetime('{{StartTimeISO}}');
 let endtime = todatetime('{{EndTimeISO}}');
 let ioc_lookBack = 14d;
